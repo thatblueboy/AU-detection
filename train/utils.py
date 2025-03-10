@@ -7,6 +7,7 @@ from sklearn.model_selection import GroupKFold
 from itertools import islice
 from sklearn.metrics import precision_recall_fscore_support
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import WeightedRandomSampler
 import os
 
 def train_one_epoch(model, train_loader, criterion, optimizer, device):
@@ -20,6 +21,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         
         optimizer.zero_grad()
         outputs = model(X, edge_index[0])  # Forward pass
+        print("outputs", outputs)
+        print("labels", labels)
         loss = criterion(outputs, labels)  # Compute loss
         loss.backward()
         optimizer.step()
@@ -69,7 +72,7 @@ def evaluate(model, val_loader, criterion, device):
     accuracy = correct / total
     return avg_loss, accuracy, f1, recall
 
-def train(dataset, 
+def train_balanced(dataset, 
           model_class, 
           model_params,
           num_epochs=10, 
@@ -77,7 +80,8 @@ def train(dataset,
           optimizer_params=None, 
           expt_name="test",
           max_folds=None, 
-          criterion=None):
+          criterion=None,
+          device =None):
     """
     Trains a model using cross-validation on a grouped dataset.
     
@@ -96,8 +100,9 @@ def train(dataset,
     subjects = np.array(dataset.subjects)  
     num_subjects = len(set(subjects))  
     print(f"Total subjects: {num_subjects}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if criterion is None:
         criterion = nn.BCELoss()
@@ -112,17 +117,195 @@ def train(dataset,
     writer = SummaryWriter(log_dir=log_dir)
 
     # Log Hyperparameters
-    writer.add_hparams(
-        {
-            "num_epochs": num_epochs,
-            "learning_rate": optimizer_params.get("lr", 1e-3),
-            "num_subjects": num_subjects,
-            "max_folds": max_folds if max_folds is not None else num_subjects,
-            **{f"model_param_{k}": v for k, v in model_params.items()},
-            **{f"opt_param_{k}": v for k, v in optimizer_params.items()}
-        },
-        {}
-    )
+    for k, v in {
+    "num_epochs": num_epochs,
+    "learning_rate": optimizer_params.get("lr", 1e-3),
+    "num_subjects": num_subjects,
+    "max_folds": max_folds if max_folds is not None else num_subjects,
+    **{f"model_param_{k}": v for k, v in model_params.items()},
+    **{f"opt_param_{k}": v for k, v in optimizer_params.items()}
+    }.items():writer.add_scalar(f"hparams/{k}", v, 0)  # Log hyperparams under "hparams/"
+
+    gkf = GroupKFold(n_splits=num_subjects)
+    fold_iterator = gkf.split(range(len(subjects)), groups=subjects)
+    fold_iterator = islice(enumerate(fold_iterator), max_folds) if max_folds is not None else enumerate(fold_iterator)
+
+    # Store per-fold metrics
+    f1_scores, accuracies, recalls = [], [], []
+
+    for fold_idx, (train_idx, val_idx) in fold_iterator:
+        print(f"Fold {fold_idx+1}/{num_subjects}: Training on {len(train_idx)} samples, Testing on {len(val_idx)} samples")
+        
+        # Ensure labels are integer type
+
+        print(type(dataset[0][2]), dataset[0][2])  # Check data type and values
+
+        train_labels = torch.tensor([dataset[i][2].item() for i in train_idx], dtype=torch.long)  
+
+        # Compute class counts
+        class_counts = torch.bincount(train_labels)
+
+        # Avoid division by zero
+        class_counts = class_counts.float() + 1e-6  
+
+        # Compute weights
+        class_weights = 1.0 / class_counts
+        weights = class_weights[train_labels]
+
+        # Create a sampler
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_idx), replacement=True)
+
+        # Use sampler in DataLoader
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=24, sampler=sampler)
+
+        # train_loader = DataLoader(Subset(dataset, train_idx), batch_size=24, shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_idx), shuffle=False)
+
+        # Count number of 1s and 0s in training set
+        # train_labels = torch.tensor([dataset[i][1] for i in train_idx])  # Assuming dataset[i] returns (features, label)
+        # val_labels = torch.tensor([dataset[i][1] for i in val_idx])
+        print(type(train_idx), train_idx)
+
+        train_labels = torch.tensor([dataset[i][2] for i in train_idx])  
+        val_labels = torch.tensor([dataset[i][2] for i in val_idx])
+
+        num_train_ones = (train_labels == 1).sum().item()
+        num_train_zeros = (train_labels == 0).sum().item()
+        num_val_ones = (val_labels == 1).sum().item()
+        num_val_zeros = (val_labels == 0).sum().item()
+
+        print(f"Train set: {num_train_ones} ones, {num_train_zeros} zeros")
+        print(f"Val set: {num_val_ones} ones, {num_val_zeros} zeros")
+
+        # writer.add_scalar(f"Fold{fold_idx+1}/Train Ones", num_train_ones, fold_idx)
+        # writer.add_scalar(f"Fold{fold_idx+1}/Train Zeros", num_train_zeros, fold_idx)
+        # writer.add_scalar(f"Fold{fold_idx+1}/Val Ones", num_val_ones, fold_idx)
+        # writer.add_scalar(f"Fold{fold_idx+1}/Val Zeros", num_val_zeros, fold_idx)
+
+        writer.add_scalar(f"Commons/Train Ones", num_train_ones, fold_idx)
+        writer.add_scalar(f"Commons/Train Zeros", num_train_zeros, fold_idx)
+        writer.add_scalar(f"Commons/Val Ones", num_val_ones, fold_idx)
+        writer.add_scalar(f"Commons/Val Zeros", num_val_zeros, fold_idx)
+        
+        model = model_class(**model_params) if isinstance(model_params, dict) else model_class(model_params)
+        model.to(device)
+
+        optimizer = optimizer_class(model.parameters(), **optimizer_params)
+
+        for epoch in range(num_epochs):  
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_acc, val_f1, val_recall = evaluate(model, val_loader, criterion, device)
+
+            print(f"Epoch {epoch+1}: "
+                  f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f} | "
+                  f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}, "
+                  f"F1={val_f1:.4f}, Recall={val_recall:.4f}")
+
+            writer.add_scalar(f"Fold{fold_idx+1}/Train Loss", train_loss, epoch)
+            writer.add_scalar(f"Fold{fold_idx+1}/Train Accuracy", train_acc, epoch)
+            writer.add_scalar(f"Fold{fold_idx+1}/Val Loss", val_loss, epoch)
+            writer.add_scalar(f"Fold{fold_idx+1}/Val Accuracy", val_acc, epoch)
+            writer.add_scalar(f"Fold{fold_idx+1}/F1 Score", val_f1, epoch)
+            writer.add_scalar(f"Fold{fold_idx+1}/Recall", val_recall, epoch)
+
+        # Store fold results
+        f1_scores.append(val_f1)
+        accuracies.append(val_acc)
+        recalls.append(val_recall)
+
+    # Compute average metrics
+    avg_f1 = np.mean(f1_scores)
+    avg_acc = np.mean(accuracies)
+    avg_recall = np.mean(recalls)
+
+    # Create Markdown Table
+    table = f"""
+    | Fold | Accuracy | F1 Score | Recall |
+    |------|---------|---------|--------|
+    """
+    for i, (acc, f1, recall) in enumerate(zip(accuracies, f1_scores, recalls)):
+        table += f"| {i+1} | {acc:.4f} | {f1:.4f} | {recall:.4f} |\n"
+    
+    # Add average metrics
+    table += f"| **Average** | **{avg_acc:.4f}** | **{avg_f1:.4f}** | **{avg_recall:.4f}** |\n"
+
+    # Log per-fold metrics to TensorBoard
+    for i, (acc, f1, recall) in enumerate(zip(accuracies, f1_scores, recalls)):
+        writer.add_scalars("Per-Fold Metrics", {
+            "Accuracy": acc,
+            "F1 Score": f1,
+            "Recall": recall
+        }, i + 1)
+
+    # Log final average metrics
+    writer.add_scalars("Average Metrics", {
+        "Accuracy": avg_acc,
+        "F1 Score": avg_f1,
+        "Recall": avg_recall
+    }, num_subjects + 1)
+    
+        # Log final table as text in TensorBoard
+    writer.add_text("Cross-Validation Results", table)
+
+    print("\nFinal Average Metrics:")
+    print(table)
+
+    writer.close()
+    print("Training completed!")
+
+def train(dataset, 
+          model_class, 
+          model_params,
+          num_epochs=10, 
+          optimizer_class=None, 
+          optimizer_params=None, 
+          expt_name="test",
+          max_folds=None, 
+          criterion=None,
+          device =None):
+    """
+    Trains a model using cross-validation on a grouped dataset.
+    
+    Args:
+        dataset: PyTorch dataset with `subjects` attribute for grouped cross-validation.
+        model_class: Class of the model to be trained.
+        model_params: Dictionary of model initialization parameters.
+        num_epochs: Number of training epochs.
+        optimizer_class: Optimizer class (default: Adam).
+        optimizer_params: Dictionary of optimizer parameters.
+        expt_name: Name of the experiment for TensorBoard logging.
+        max_folds: Maximum number of folds for cross-validation.
+        criterion: Loss function (default: BCELoss).
+    """
+    
+    subjects = np.array(dataset.subjects)  
+    num_subjects = len(set(subjects))  
+    print(f"Total subjects: {num_subjects}")
+    
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if criterion is None:
+        criterion = nn.BCELoss()
+
+    if optimizer_class is None:
+        optimizer_class = optim.Adam  # Default to Adam
+
+    if optimizer_params is None:
+        optimizer_params = {"lr": 1e-3}  # Default learning rate
+
+    log_dir = os.path.join("/media/thatblueboy/Seagate/LOP/logs", expt_name)
+    writer = SummaryWriter(log_dir=log_dir)
+
+    # Log Hyperparameters
+    for k, v in {
+    "num_epochs": num_epochs,
+    "learning_rate": optimizer_params.get("lr", 1e-3),
+    "num_subjects": num_subjects,
+    "max_folds": max_folds if max_folds is not None else num_subjects,
+    **{f"model_param_{k}": v for k, v in model_params.items()},
+    **{f"opt_param_{k}": v for k, v in optimizer_params.items()}
+    }.items():writer.add_scalar(f"hparams/{k}", v, 0)  # Log hyperparams under "hparams/"
 
     gkf = GroupKFold(n_splits=num_subjects)
     fold_iterator = gkf.split(range(len(subjects)), groups=subjects)
@@ -137,6 +320,32 @@ def train(dataset,
         train_loader = DataLoader(Subset(dataset, train_idx), batch_size=24, shuffle=True)
         val_loader = DataLoader(Subset(dataset, val_idx), shuffle=False)
 
+        # Count number of 1s and 0s in training set
+        # train_labels = torch.tensor([dataset[i][1] for i in train_idx])  # Assuming dataset[i] returns (features, label)
+        # val_labels = torch.tensor([dataset[i][1] for i in val_idx])
+        print(type(train_idx), train_idx)
+
+        train_labels = torch.tensor([dataset[i][2] for i in train_idx])  
+        val_labels = torch.tensor([dataset[i][2] for i in val_idx])
+
+        num_train_ones = (train_labels == 1).sum().item()
+        num_train_zeros = (train_labels == 0).sum().item()
+        num_val_ones = (val_labels == 1).sum().item()
+        num_val_zeros = (val_labels == 0).sum().item()
+
+        print(f"Train set: {num_train_ones} ones, {num_train_zeros} zeros")
+        print(f"Val set: {num_val_ones} ones, {num_val_zeros} zeros")
+
+        # writer.add_scalar(f"Fold{fold_idx+1}/Train Ones", num_train_ones, fold_idx)
+        # writer.add_scalar(f"Fold{fold_idx+1}/Train Zeros", num_train_zeros, fold_idx)
+        # writer.add_scalar(f"Fold{fold_idx+1}/Val Ones", num_val_ones, fold_idx)
+        # writer.add_scalar(f"Fold{fold_idx+1}/Val Zeros", num_val_zeros, fold_idx)
+
+        writer.add_scalar(f"Commons/Train Ones", num_train_ones, fold_idx)
+        writer.add_scalar(f"Commons/Train Zeros", num_train_zeros, fold_idx)
+        writer.add_scalar(f"Commons/Val Ones", num_val_ones, fold_idx)
+        writer.add_scalar(f"Commons/Val Zeros", num_val_zeros, fold_idx)
+        
         model = model_class(**model_params) if isinstance(model_params, dict) else model_class(model_params)
         model.to(device)
 
