@@ -1,10 +1,10 @@
-from datasets.in_mem_graph_dataset import InMemoryGraphDataset
+from datasets.CASME3.graph_dataset import GraphDataset
 
-class AU4GraphDataset(InMemoryGraphDataset): #TODO use config file
-    def __init__(self, device='cpu'):
+class AU4GraphDataset(GraphDataset): #TODO use config file
+    def __init__(self):
         images_folder = "/media/thatblueboy/Seagate/LOP/data/raw/part_A/data/Part_A_ME_clip/frame"
         depth_folder = "/media/thatblueboy/Seagate/LOP/data/raw/part_A/data/Part_A_ME_clip/depth"
-        labels_csv = "/media/thatblueboy/Seagate/LOP/data/processed/even_further_cleaned_au4.csv"
+        labels_csv = "/media/thatblueboy/Seagate/LOP/data/processed/cleaned_au4.csv"
         ROI_index  = list(range(18, 29))+list(range(37, 49))
         edges = [(18, 37), (19, 38), (20, 38), (21, 39), (22, 40), 
                       (22, 28), (18, 19), (19, 20), (20, 21), (21, 22),
