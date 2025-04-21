@@ -1,14 +1,17 @@
-from torch.utils.data import Dataset
+import os
 from abc import ABC, abstractmethod
+
 import torch
+import pickle
 import pandas as pd
+from torch.utils.data import Dataset
+
 from datasets.utils.helpers import GraphGenerator
 
 
 class BaseInMemoryGraphDataset(Dataset, ABC): 
     '''
-    Makes stacked Graphs of 5 frames from onset to offset
-    input: frames_path, depth_path, labels_path, landmarks(different for different AU), edges(different for different AU)
+    Makes stacked Graphs of n frames from onset to offset
     '''
     def __init__(self, 
                  frames_path, 
@@ -25,7 +28,8 @@ class BaseInMemoryGraphDataset(Dataset, ABC):
                  self_loop_in_edge_index=True,
                  normalizing_factor=400,
                  image_size=(400, 400),
-                 device='cpu'):
+                 device='cpu',
+                 processed_data_path=None):
         
         assert num_timesteps in {5, 10, 15, 20}, "timesteps must be 5, 10, 15, or 20"
 
@@ -46,6 +50,7 @@ class BaseInMemoryGraphDataset(Dataset, ABC):
         self.noise_params = noise_params
         self.noise_bounds = noise_bounds
         self.noise = noise
+        self.processed_data_path = processed_data_path
 
         edge_list = []
         node_mapping = {node: i for i, node in enumerate(landmarks)}
@@ -59,13 +64,43 @@ class BaseInMemoryGraphDataset(Dataset, ABC):
              
         self.edge_index = torch.tensor(edge_list, dtype=torch.long).T
 
-        self.generate_graphs()
-        
+        if processed_data_path is None:
+            print("No processed data path provided. Generating graphs...")
+            self.generate_graphs()
+            
+        elif not os.path.exists(processed_data_path) or os.path.getsize(processed_data_path) == 0:
+            print(f"{processed_data_path} is missing or empty. Generating and saving new graphs...")
+            self.generate_graphs()
+            try:
+                with open(processed_data_path, 'wb') as f:
+                    pickle.dump({
+                        'x': self.X,
+                        'all_au_labels': self.all_au_labels,
+                        'edge_index': self.edge_index,
+                        'subjects': self.subjects
+                    }, f)
+                print(f"Data saved to {processed_data_path}")
+            except Exception as e:
+                print(f"Failed to save data: {e}")
+            
+        else:
+            try:
+                with open(processed_data_path, 'rb') as f:
+                    loaded_data = pickle.load(f)
+                print(f"Data successfully loaded from {processed_data_path}")
+
+                self.X = loaded_data.get('x')
+                self.all_au_labels = loaded_data.get('all_au_labels')
+                self.edge_index = loaded_data.get('edge_index')
+                self.subjects = loaded_data.get('subjects')
+
+            except Exception as e:
+                print(f"An error occurred while loading the data: {e}")
+
         self.au_indices = [0] #which of au{list} is label
 
         self.X = self.X.to(self.device)
-        self.y = self.all_au_labels.to(self.device)
-        # self.y = self.y.to(self.device)
+        self.all_au_labels = self.all_au_labels.to(self.device)
 
     @abstractmethod
     def generate_graphs(self):

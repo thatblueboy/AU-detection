@@ -1,23 +1,16 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import GroupKFold
-from itertools import islice
-from sklearn.metrics import precision_recall_fscore_support
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import WeightedRandomSampler
 import os
+from itertools import islice
+
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-import numpy as np
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.model_selection import StratifiedGroupKFold
 from scipy.stats import mode
+from sklearn.model_selection import GroupKFold
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import precision_recall_fscore_support
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 
 def train_one_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
@@ -38,7 +31,13 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         total_loss += loss.item()
 
         # Convert probabilities to binary predictions
-        predicted = (outputs >= 0.5).long()
+        if isinstance(criterion, torch.nn.BCEWithLogitsLoss):
+                probs = torch.sigmoid(outputs)
+                predicted = (probs >= 0.5).long()
+        else:
+            predicted = (outputs >= 0.5).long()
+        # predicted = (outputs >= 0.5).long()
+
         correct += (predicted == labels.long()).sum().item()
         total += labels.size(0)
 
@@ -62,10 +61,15 @@ def evaluate(model, val_loader, criterion, device):
 
             outputs = model(X, edge_index[0])  # Forward pass
             loss = criterion(outputs, labels)
-
             total_loss += loss.item()
+            
+            # If using BCEWithLogitsLoss, apply sigmoid for thresholding
+            if isinstance(criterion, torch.nn.BCEWithLogitsLoss):
+                probs = torch.sigmoid(outputs)
+                predicted = (probs >= 0.5).long()
+            else:
+                predicted = (outputs >= 0.5).long()
 
-            predicted = (outputs >= 0.5).long()
             all_preds.append(predicted.cpu())
             all_labels.append(labels.long().cpu())
 
@@ -244,69 +248,6 @@ def LOSO_CV(dataset,
 
     writer.close()
     print("Training completed!")
-
-def pretrain(model, 
-             dataset, 
-             criterion, 
-             optimizer, 
-             epochs=10, 
-             batch_size=32, 
-             balanced_sampling=False,
-             save_path="model.pth", 
-             device="cuda"):
-    """
-    Train a model over entire dataset
-
-    Args:
-        model (torch.nn.Module): The model to train.
-        dataset (torch.utils.data.Dataset): The dataset containing features and labels.
-        criterion (torch.nn.Module): Loss function.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        epochs (int): Number of training epochs.
-        batch_size (int): Batch size.
-        save_path (str): Path to save the trained model.
-        device (str): Device to run the training on ("cuda" or "cpu").
-
-    Returns:
-        Trained model
-    """
-
-    # Move model to device
-    model.to(device)
-    # train_labels = torch.tensor([dataset[i][2].item() for i in train_idx], dtype=torch.long)  
-
-    if balanced_sampling:
-        # Get class distribution
-        labels = np.array([dataset[i][2].item() for i in range(len(dataset))], dtype=torch.long)
-        class_counts = np.bincount(labels)
-        class_weights = 1.0 / class_counts
-        sample_weights = class_weights[labels]
-        sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(dataset), replacement=True)
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=4, pin_memory=True)
-    else:
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-
-        for X, edge_index, labels, _ in dataloader:
-            X, edge_index, labels = X.to(device), edge_index.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(X, edge_index[0])
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(dataloader)}")
-
-    # Save the trained model
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-    return model
 
 def KFold(dataset, 
           model_class, 
@@ -560,7 +501,7 @@ def train_one_fold(dataset, num_epochs, train_subjects, val_subjects, model_clas
         
 #     return folds
 
-def create_4_subject_independent_folds(subjects, labels, n_splits=4):
+def create_4_subject_independent_folds(subjects, labels, n_splits=4, random_state=42):
     """
     Create subject-independent folds with balanced class distribution using StratifiedGroupKFold.
 
@@ -572,7 +513,7 @@ def create_4_subject_independent_folds(subjects, labels, n_splits=4):
     Returns:
         List of folds, where each fold is a list of subject IDs.
     """
-    skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     
     unique_subjects = np.unique(subjects)
     subject_to_label = {}
@@ -607,6 +548,220 @@ def create_4_subject_independent_folds(subjects, labels, n_splits=4):
     #     print(f"Fold {i+1}: {len(fold)} subjects, {fold_counts[i]['total']} samples, {fold_counts[i]['0s']} class 0, {fold_counts[i]['1s']} class 1")
     
     return folds
+
+def train_1(dataset, model_class, model_params, train_subjects, test_subjects, num_epochs=10, 
+             optimizer_class=None, optimizer_params=None, criterion=None, device=None, 
+             batch_size=24, balanced_sampling=False, log_dir="runs/train", save_every_n_epochs=5): 
+    
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if criterion is None:
+        criterion = torch.nn.BCELoss()
+    
+    if optimizer_class is None:
+        optimizer_class = torch.optim.Adam
+    
+    if optimizer_params is None:
+        optimizer_params = {"lr": 1e-3}
+    
+    writer = SummaryWriter(log_dir)
+    model_save_dir = os.path.join(log_dir, "models")
+    os.makedirs(model_save_dir, exist_ok=True)
+    
+    # Filter dataset by subjects
+    train_indices = [i for i, subj in enumerate(dataset.subjects) if subj in train_subjects]
+    test_indices = [i for i, subj in enumerate(dataset.subjects) if subj in test_subjects]
+    
+    if balanced_sampling:
+            train_labels = torch.tensor([dataset[i][2].item() for i in train_indices], dtype=torch.long)  
+            class_counts = torch.bincount(train_labels)
+            class_counts = class_counts.float() + 1e-6  
+            class_weights = 1.0 / class_counts
+            weights = class_weights[train_labels]
+            sampler = WeightedRandomSampler(weights, num_samples=len(train_indices), replacement=True)
+            train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, sampler=sampler)
+    else:
+            train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True)
+
+    test_loader = DataLoader(Subset(dataset, test_indices), batch_size=batch_size, shuffle=False)
+    
+    model = model_class(**model_params).to(device)
+    optimizer = optimizer_class(model.parameters(), **optimizer_params)
+    
+    print("Starting Training...")
+    
+    for epoch in range(num_epochs):  
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc, val_f1, val_recall, val_precision = evaluate(model, test_loader, criterion, device)
+        
+        writer.add_scalar("Loss/Train", train_loss, epoch)
+        writer.add_scalar("Accuracy/Train", train_acc, epoch)
+        writer.add_scalar("Loss/Validation", val_loss, epoch)
+        writer.add_scalar("Accuracy/Validation", val_acc, epoch)
+        writer.add_scalar("F1/Validation", val_f1, epoch)
+        writer.add_scalar("Recall/Validation", val_recall, epoch)
+        writer.add_scalar("Precision/Validation", val_precision, epoch)
+        
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f} | "
+              f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}, F1={val_f1:.4f}, Recall={val_recall:.4f}")
+        
+        # Save model every 'n' epochs
+        if (epoch + 1) % save_every_n_epochs == 0:
+            model_path = os.path.join(model_save_dir, f"model_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), model_path)
+            print(f"Model saved at epoch {epoch+1}.")
+
+    writer.close()
+    print("Training completed!")
+
+def train_2(train_dataset, test_dataset, train_subjects, test_subjects, model_class, model_params, 
+          num_epochs=10, optimizer_class=None, optimizer_params=None, criterion=None, device=None, 
+          batch_size=24, balanced_sampling=False, log_dir="runs/pretrain", 
+          save_every_n_epochs=5, model_path=None):  # Accept both datasets and subjects
+    
+    # Set device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+    # Set loss function
+    if criterion is None:
+        criterion = torch.nn.BCELoss()
+    
+    # Set optimizer
+    if optimizer_class is None:
+        optimizer_class = torch.optim.Adam
+    if optimizer_params is None:
+        optimizer_params = {"lr": 1e-3}
+    
+    # Setup for TensorBoard logging
+    writer = SummaryWriter(log_dir)
+    model_save_dir = os.path.join(log_dir, "models")
+    os.makedirs(model_save_dir, exist_ok=True)
+    
+    # Filter train dataset by train subjects
+    train_indices = [i for i, subj in enumerate(train_dataset.subjects) if subj in train_subjects]
+    
+    # Filter test dataset by test subjects
+    test_indices = [i for i, subj in enumerate(test_dataset.subjects) if subj in test_subjects]
+    
+    # Prepare DataLoader for train and test datasets
+    if balanced_sampling:
+        # Get labels from filtered train dataset
+        train_labels = torch.tensor([train_dataset[i][2].item() for i in train_indices], dtype=torch.long)
+        
+        # Compute class weights for balancing
+        class_counts = torch.bincount(train_labels)
+        class_counts = class_counts.float() + 1e-6  # Add small constant to avoid division by zero
+        class_weights = 1.0 / class_counts
+        weights = class_weights[train_labels]
+        
+        # Create a weighted random sampler
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_indices), replacement=True)
+        
+        train_loader = DataLoader(Subset(train_dataset, train_indices), batch_size=batch_size, sampler=sampler)
+    else:
+        train_loader = DataLoader(Subset(train_dataset, train_indices), batch_size=batch_size, shuffle=True)
+
+    test_loader = DataLoader(Subset(test_dataset, test_indices), batch_size=batch_size, shuffle=False)
+    
+    # Initialize model
+    model = model_class(**model_params).to(device)
+    if model_path is not None:
+        model.load_state_dict(torch.load(model_path))
+
+    # Load model from checkpoint if provided
+    start_epoch = 0
+    
+
+    # Initialize optimizer
+    optimizer = optimizer_class(model.parameters(), **optimizer_params)
+    
+    print("Starting Training...")
+    
+    # Training loop
+    for epoch in range(start_epoch, num_epochs):  
+        # Train one epoch
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        
+        # Evaluate on the validation set (test set in your case)
+        val_loss, val_acc, val_f1, val_recall, val_precision = evaluate(model, test_loader, criterion, device)
+        
+        # Log metrics to TensorBoard
+        writer.add_scalar("Loss/Train", train_loss, epoch)
+        writer.add_scalar("Accuracy/Train", train_acc, epoch)
+        writer.add_scalar("Loss/Validation", val_loss, epoch)
+        writer.add_scalar("Accuracy/Validation", val_acc, epoch)
+        writer.add_scalar("F1/Validation", val_f1, epoch)
+        writer.add_scalar("Recall/Validation", val_recall, epoch)
+        writer.add_scalar("Precision/Validation", val_precision, epoch)
+        
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f} | "
+              f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}, F1={val_f1:.4f}, Recall={val_recall:.4f}")
+        
+        # Save model every 'n' epochs
+        if (epoch + 1) % save_every_n_epochs == 0:
+            model_path = os.path.join(model_save_dir, f"model_epoch_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, model_path)
+            print(f"Model saved at epoch {epoch+1}.")
+
+    writer.close()
+    print("Training completed!")
+
+def evaluate_subjects(dataset, subjects, model_class, model_params, 
+                      model_path, criterion=None, device=None, batch_size=24):
+    """
+    Evaluates a model on a specific subset of subjects in a dataset.
+
+    Args:
+        dataset: PyTorch dataset with a .subjects attribute.
+        subjects: List of subject identifiers to evaluate on.
+        model_class: Class of the model to instantiate.
+        model_params: Dictionary of parameters to pass to the model constructor.
+        model_path: Path to the saved model checkpoint (.pth).
+        criterion: Loss function (default: BCELoss).
+        device: PyTorch device (default: auto-detect CUDA if available).
+        batch_size: Batch size for evaluation.
+
+    Returns:
+        Tuple of (loss, accuracy, F1, recall, precision).
+    """
+
+
+    # Set device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Set loss function
+    if criterion is None:
+        criterion = torch.nn.BCELoss()
+
+    # Filter dataset by given subjects
+    subject_indices = [i for i, subj in enumerate(dataset.subjects) if subj in subjects]
+    eval_loader = DataLoader(Subset(dataset, subject_indices), batch_size=batch_size, shuffle=False)
+
+    # Initialize and load model
+    model = model_class(**model_params).to(device)
+
+    if model_path is not None:
+        checkpoint = torch.load(model_path, map_location=device)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+
+    # Evaluate the model
+    print(f"Evaluating on {len(subject_indices)} samples from specified subjects...")
+    val_loss, val_acc, val_f1, val_recall, val_precision = evaluate(model, eval_loader, criterion, device)
+
+    print(f"Evaluation Results — Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, "
+          f"F1: {val_f1:.4f}, Recall: {val_recall:.4f}, Precision: {val_precision:.4f}")
+
+    return val_loss, val_acc, val_f1, val_recall, val_precision
 
 class F1Loss(nn.Module):
     def __init__(self, epsilon=1e-6):

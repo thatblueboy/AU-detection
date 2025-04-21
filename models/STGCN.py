@@ -1,17 +1,12 @@
-import sys
-sys.path.append("/media/thatblueboy/Seagate/LOP")
-
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GCNConv
-import torch
-import torch.nn as nn
 
 class STConv(nn.Module):
     '''
     Spatio Temporal GCN
     '''
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, residual=True):
+    def __init__(self, in_channels, out_channels, num_edges, kernel_size=3, stride=1, residual=True):
         super(STConv, self).__init__()
         self.gcn = GCNConv(in_channels, out_channels)
         self.gcn_bn = nn.BatchNorm2d(out_channels)
@@ -20,6 +15,7 @@ class STConv(nn.Module):
         self.tcn_bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU()
         # self.padding = (kernel_size - 1) //2
+        self.edge_weight = nn.Parameter(torch.ones(num_edges))
 
         if not residual:
             self.residual = lambda x: 0
@@ -56,28 +52,30 @@ class STConv(nn.Module):
         return self.relu(x_out +res)
 
 class STGCN(nn.Module):
-    def __init__(self, in_channels, num_nodes, num_timesteps):
+    def __init__(self, in_channels, num_nodes, num_edges, num_timesteps):
         super(STGCN, self).__init__()
 
         # Spatio-temporal convolution layers using STConv2
-        self.st_conv1 = STConv(in_channels, out_channels=4, kernel_size=3)
-        self.st_conv2 = STConv(4, out_channels=8, kernel_size=3)
-        self.st_conv3 = STConv(8, out_channels=16, kernel_size=3)
-        self.st_conv4 = STConv(16, out_channels=32, kernel_size=5)
-        self.st_conv5 = STConv(32, out_channels=64, kernel_size=5)
+        self.st_conv1 = STConv(in_channels, out_channels=4, num_edges=num_edges, kernel_size=3)
+        self.st_conv2 = STConv(4, out_channels=8, num_edges=num_edges, kernel_size=3)
+        self.st_conv3 = STConv(8, out_channels=16, num_edges=num_edges, kernel_size=3)
+        self.st_conv4 = STConv(16, out_channels=32, num_edges=num_edges, kernel_size=5)
+        self.st_conv5 = STConv(32, out_channels=64, num_edges=num_edges, kernel_size=5)
+        self.st_conv6 = STConv(64, out_channels=128, num_edges=num_edges, kernel_size=5)
+        self.st_conv7 = STConv(128, out_channels=256, num_edges=num_edges, kernel_size=5)
 
         self.conv = nn.Conv2d(in_channels=num_timesteps, out_channels=1, kernel_size=(num_nodes, 1))
 
         # Fully connected classifier
         self.classifier = nn.Sequential(
-            nn.Linear(64, 128),  
+            nn.Linear(256, 128),  
             nn.ReLU(),  
             nn.Linear(128, 64),  
             nn.ReLU(),
             nn.Linear(64, 16),  
             nn.ReLU(),
             nn.Linear(16, 1),
-            nn.Sigmoid()  # Binary classification
+            # nn.Sigmoid()  # Binary classification
         )
 
     def forward(self, x, edge_index):
@@ -88,8 +86,8 @@ class STGCN(nn.Module):
         x = self.st_conv3(x, edge_index)
         x = self.st_conv4(x, edge_index)
         x = self.st_conv5(x, edge_index)
-
-        # x = self.st_conv6(x, edge_index)
+        x = self.st_conv6(x, edge_index)
+        x = self.st_conv7(x, edge_index)
         
         # Global Average Pooling over nodes (keep batch & features)
         # x = torch.mean(x, dim=(1, 2))  # Reduce nodes dimension
@@ -104,4 +102,3 @@ class STGCN(nn.Module):
         y = self.classifier(x_flat)
         
         return y.squeeze(-1)  # (batch_size, 1)
-  
